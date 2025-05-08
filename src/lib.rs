@@ -121,7 +121,7 @@
 //! ```
 //!
 //!
-//! **A side node about sizing of the context menu:**  
+//! **A side node about sizing of the context menu:**
 //! All nodes and the fallback share the same context menu. In egui, the size of a context menu
 //! is determined the first time the context menu becomes visible. For this reason, you might have
 //! to set the size of the context menu manually with `ui.set_width` if you plan on having multiple
@@ -141,7 +141,7 @@
 //!
 //! ### Drag and Move actions
 //! The [`Drag`](`Action::Drag`) and [`Move`](`Action::Move`) can be used to implement a drag and drop
-//! interaction of the tree.  
+//! interaction of the tree.
 //! A drag that has not yet been dropped is represented by the [`Drag`](`Action::Drag`) action. With
 //! this action you can test if the drag is valid or not. If the drag invalid you may decide to remove the drop
 //! marker from the tree by calling the [`DragAndDrop::remove_drop_marker`] method of the action.
@@ -303,6 +303,20 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
         self
     }
 
+    /// Set the estimated (or actual) tree size. This is to help with memory allocation
+    /// optimizations.
+    pub fn tree_size_hint(mut self, size: usize) -> Self {
+        self.settings.tree_size_hint = size;
+        self
+    }
+
+    /// Set the estimated (or actual) number of dirs. This is to help with memory allocation
+    /// optimizations.
+    pub fn dir_count_hint(mut self, dir_count: usize) -> Self {
+        self.settings.dir_count_hint = Some(dir_count);
+        self
+    }
+
     /// Add a fallback context menu to the tree.
     ///
     /// If the node did not configure a context menu directly or
@@ -376,6 +390,7 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
             )
         });
 
+        state.ensure_capacity(self.settings.tree_size_hint);
         state.prepare(self.settings.allow_multi_select);
 
         let background_shapes = BackgroundShapes::new(ui, state);
@@ -552,11 +567,7 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
         let mut selection_changed = false;
         let mut should_activate = false;
 
-        let node_ids = state
-            .node_states()
-            .iter()
-            .map(|ns| ns.id)
-            .collect::<Vec<_>>();
+        let node_ids: Vec<_> = state.node_states().keys().cloned().collect();
         for node_id in node_ids {
             let RowRectangles {
                 row_rect,
@@ -653,7 +664,7 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
                     .iter()
                     .for_each(|id| _ = invalid_drop_targets.insert(*id));
             }
-            for node_state in state.node_states() {
+            for node_state in state.node_states().values() {
                 // Dropping a node on itself is technically a fine thing to do
                 // but it causes all sorts of problems for the implementer of the drop action.
                 // They would have to remove a node and then somehow insert it after itself.
@@ -692,7 +703,7 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
                     .dragged
                     .as_ref()
                     .map(|drag_state| drag_state.node_ids.clone())
-                    .or(state.node_states().first().map(|n| vec![n.id]));
+                    .or(state.node_states().first().map(|(id, _)| vec![*id]));
                 if let Some(fallback_selection) = fallback_selection {
                     state.set_selected(fallback_selection);
                     selection_changed = true;
@@ -794,7 +805,7 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
                     let mut last_child = None;
                     let mut child_nodes = HashSet::<NodeIdType>::new();
                     child_nodes.insert(parent_id);
-                    for node in state.node_states() {
+                    for node in state.node_states().values() {
                         if let Some(parent_id) = node.parent_id {
                             if child_nodes.contains(&parent_id) {
                                 child_nodes.insert(node.id);
@@ -939,7 +950,7 @@ fn simplify_selection_for_dnd<NodeIdType: NodeId>(
     // leaf inside that folder. In that case, a drag and drop action should only include the folder and not the leaf.
     let mut result = Vec::new();
     let mut known_nodes = HashSet::new();
-    for node in state.node_states() {
+    for node in state.node_states().values() {
         if !nodes.contains(&node.id) {
             continue;
         }
@@ -1057,6 +1068,12 @@ pub struct TreeViewSettings {
     /// If the tree view is allowed to select multiple nodes at once.
     /// Default is true.
     pub allow_multi_select: bool,
+    /// A hint for the upper bound of the tree size. This helps optimize memory allocations.
+    /// Default is 16.
+    pub tree_size_hint: usize,
+    /// A hint for the upper bound of directory count. This helps optimize memory allocations.
+    /// Default is 1/4 of the total tree size, rounded up to the nearest power of two.
+    pub dir_count_hint: Option<usize>,
 }
 
 impl Default for TreeViewSettings {
@@ -1072,6 +1089,8 @@ impl Default for TreeViewSettings {
             fill_space_horizontal: true,
             fill_space_vertical: false,
             allow_multi_select: true,
+            tree_size_hint: 16,
+            dir_count_hint: None,
         }
     }
 }

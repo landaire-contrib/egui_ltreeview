@@ -1,6 +1,8 @@
+use core::hash::Hash;
 use std::collections::HashMap;
 
 use egui::{pos2, vec2, LayerId, Order, Pos2, Rect, Response, Ui, WidgetText};
+use indexmap::IndexMap;
 
 use crate::{
     node::NodeBuilder, IndentHintStyle, NodeId, NodeState, TreeViewSettings, TreeViewState,
@@ -22,8 +24,11 @@ struct DirectoryState<NodeIdType> {
     flattened: bool,
 }
 
-pub(crate) struct TreeViewBuilderResult<NodeIdType> {
-    pub(crate) new_node_states: Vec<NodeState<NodeIdType>>,
+pub(crate) struct TreeViewBuilderResult<NodeIdType>
+where
+    NodeIdType: Hash + Eq,
+{
+    pub(crate) new_node_states: IndexMap<NodeIdType, NodeState<NodeIdType>>,
     pub(crate) row_rectangles: HashMap<NodeIdType, RowRectangles>,
     pub(crate) seconday_click: Option<NodeIdType>,
     pub(crate) context_menu_was_open: bool,
@@ -39,7 +44,10 @@ pub(crate) struct RowRectangles {
 /// The builder used to construct the tree.
 ///
 /// Use this to add directories or leaves to the tree.
-pub struct TreeViewBuilder<'ui, NodeIdType> {
+pub struct TreeViewBuilder<'ui, NodeIdType>
+where
+    NodeIdType: Hash + Eq,
+{
     ui: &'ui mut Ui,
     state: &'ui TreeViewState<NodeIdType>,
     settings: &'ui TreeViewSettings,
@@ -56,10 +64,18 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
         settings: &'ui TreeViewSettings,
         tree_has_focus: bool,
     ) -> Self {
+        let stack_capacity = settings.dir_count_hint.unwrap_or_else(|| {
+            let estimated_dirs = (settings.tree_size_hint / 4);
+            if estimated_dirs.is_power_of_two() {
+                estimated_dirs
+            } else {
+                1 << (usize::BITS - estimated_dirs.leading_zeros())
+            }
+        });
         Self {
             result: TreeViewBuilderResult {
-                new_node_states: Vec::new(),
-                row_rectangles: HashMap::new(),
+                new_node_states: Default::default(),
+                row_rectangles: HashMap::with_capacity(settings.tree_size_hint),
                 seconday_click: None,
                 interaction,
                 context_menu_was_open: false,
@@ -69,7 +85,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 ),
             },
             state,
-            stack: Vec::new(),
+            stack: Vec::with_capacity(stack_capacity),
             settings,
             tree_has_focus,
             ui,
@@ -170,15 +186,18 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             (Rect::NOTHING, Some(Rect::NOTHING))
         };
 
-        self.result.new_node_states.push(NodeState {
-            id: node.id,
-            parent_id: self.parent_id(),
-            open,
-            visible: self.parent_dir_is_open() && !node.flatten,
-            drop_allowed: node.drop_allowed,
-            dir: node.is_dir,
-            activatable: node.activatable,
-        });
+        self.result.new_node_states.insert(
+            node.id,
+            NodeState {
+                id: node.id,
+                parent_id: self.parent_id(),
+                open,
+                visible: self.parent_dir_is_open() && !node.flatten,
+                drop_allowed: node.drop_allowed,
+                dir: node.is_dir,
+                activatable: node.activatable,
+            },
+        );
         self.result.row_rectangles.insert(
             node.id,
             RowRectangles {

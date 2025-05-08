@@ -8,16 +8,12 @@ description = "A tree view widget for egui"
 repository = "https://github.com/LennysLounge/egui_ltreeview"
 categories = ["gui"]
 keywords = ["egui", "gui", "widget", "tree"]
-include = [
-    "src/**/*.rs",
-    "Cargo.toml",
-    "LICENSE"
-]
+include = ["src/**/*.rs", "Cargo.toml", "LICENSE"]
 
 [dependencies]
 egui = { version = "0.31" }
-
 serde = { version = "1", features = ["derive"], optional = true }
+indexmap = { version = "2.9.0", features = ["serde"] }
 
 [dev-dependencies]
 eframe = "0.31"
