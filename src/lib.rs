@@ -400,6 +400,13 @@ impl<'context_menu, NodeIdType: NodeId> TreeView<'context_menu, NodeIdType> {
         self.settings.node_element_gap = node_element_gap;
         self
     }
+
+    /// Set if open directories pin to the top of the view while their children
+    /// are scrolled through.
+    pub fn sticky_dirs(mut self, sticky_dirs: bool) -> Self {
+        self.settings.sticky_dirs = sticky_dirs;
+        self
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -469,6 +476,7 @@ fn draw_foreground<'context_menu, NodeIdType: NodeId>(
         .min_width
         .at_least(builder_response.space_used.width());
     state.last_height = builder_response.space_used.height();
+    state.dir_bottoms = std::mem::take(&mut builder_response.dir_bottoms);
 
     let mut open_fallback_context_menu = false;
     for action in builder_response.output {
@@ -643,6 +651,11 @@ pub struct TreeViewSettings {
     pub default_node_height: Option<f32>,
     /// The gap between elements within a node.
     pub node_element_gap: f32,
+    /// If open directories pin to the top of the view while their children are
+    /// scrolled through. The innermost directory whose children are visible pins
+    /// below the directories that contain it.
+    /// Default is false.
+    pub sticky_dirs: bool,
 }
 
 impl Default for TreeViewSettings {
@@ -663,6 +676,7 @@ impl Default for TreeViewSettings {
             allow_drag_and_drop: true,
             default_node_height: None,
             node_element_gap: 2.0,
+            sticky_dirs: false,
         }
     }
 }

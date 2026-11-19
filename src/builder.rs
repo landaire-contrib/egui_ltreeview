@@ -1,7 +1,9 @@
 use core::f32;
+use std::collections::HashMap;
+
 use egui::{
-    layers::ShapeIdx, pos2, vec2, Pos2, Rangef, Rect, Response, Shape, Stroke, Ui, UiBuilder, Vec2,
-    WidgetText,
+    layers::ShapeIdx, pos2, vec2, Align, Color32, Pos2, Rangef, Rect, Response, Shape, Stroke, Ui,
+    UiBuilder, Vec2, WidgetText,
 };
 
 use crate::{
@@ -20,9 +22,46 @@ struct DirectoryState<NodeIdType> {
     branch_expanded: bool,
     /// Whether or not the current branch is being dragged.
     branch_dragged: bool,
-    /// The rectangle at which the dir would be visible.
-    row_rect: Option<Rect>,
+    /// The rectangle to scroll to so that the dir row is visible below the rows
+    /// pinned above it.
+    scroll_rect: Option<Rect>,
+    /// Combined height of the rows of this dir and its ancestors. These rows pin
+    /// above the children of this dir.
+    pinned_stack_height: f32,
+    /// The y position at which a child dir of this dir pins.
+    /// `None` if the children of this dir cannot pin.
+    child_pin_top: Option<f32>,
+    /// The pinned position predicted for this dir, verified when the dir closes.
+    pin_check: Option<PinCheck>,
 }
+
+/// The pinned position of a dir row, computed from the extent its subtree had
+/// in the previous pass.
+#[derive(Clone, Copy)]
+struct PinCheck {
+    /// The y position at which this dir pins.
+    pin_top: f32,
+    /// Height of the dir row.
+    row_height: f32,
+    /// Top of the pinned row. `None` if the dir was not pinned.
+    pinned_top: Option<f32>,
+}
+
+impl PinCheck {
+    /// The top of the pinned row for a subtree that ends at `subtree_bottom`.
+    fn pinned_top_for(&self, subtree_bottom: f32) -> Option<f32> {
+        (subtree_bottom > self.pin_top).then(|| self.pin_top.min(subtree_bottom - self.row_height))
+    }
+}
+
+/// Where a node row was placed.
+struct NodeRow {
+    is_open: bool,
+    rect: Rect,
+    scroll_rect: Rect,
+    pin_check: Option<PinCheck>,
+}
+
 struct IndentState<NodeIdType> {
     /// Id of the node that created this indent
     source_node: NodeIdType,
@@ -45,6 +84,7 @@ pub(crate) struct TreeViewBuilderResponse<NodeIdType> {
     pub(crate) space_used: Rect,
     pub(crate) output: Vec<BuilderActions<NodeIdType>>,
     pub(crate) drop_marker_idx: ShapeIdx,
+    pub(crate) dir_bottoms: HashMap<NodeIdType, f32>,
 }
 
 pub(crate) enum BuilderActions<NodeIdType> {
@@ -91,6 +131,13 @@ pub struct TreeViewBuilder<'ui, NodeIdType: NodeId> {
     selected: bool,
     space_used: Rect,
     output: Vec<BuilderActions<NodeIdType>>,
+    /// The y position at which top level dirs pin. `None` if dirs do not pin.
+    sticky_top: Option<f32>,
+    /// Subtree bottom of each open dir, relative to the top of the tree.
+    dir_bottoms: HashMap<NodeIdType, f32>,
+    /// Offset from the tree position of the row a drag started on to where that
+    /// row was drawn. Nonzero when the drag started on a pinned row.
+    drag_start_offset: Vec2,
 }
 
 impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
@@ -102,6 +149,9 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
         input: Input<NodeIdType>,
         user_callback: impl FnOnce(&mut TreeViewBuilder<'_, NodeIdType>),
     ) -> TreeViewBuilderResponse<NodeIdType> {
+        let sticky_top = settings
+            .sticky_dirs
+            .then(|| normalize_rect(&ui.clip_rect()).top());
         let mut me = TreeViewBuilder {
             state,
             settings,
@@ -127,6 +177,9 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             selected: false,
             space_used: Rect::from_min_size(ui.cursor().min, Vec2::ZERO),
             output: Vec::new(),
+            sticky_top,
+            dir_bottoms: HashMap::new(),
+            drag_start_offset: Vec2::ZERO,
             ui,
             ui_data,
         };
@@ -134,6 +187,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
         user_callback(&mut me);
 
         me.finish_unfinished_input();
+        me.draw_pinned_separator();
 
         TreeViewBuilderResponse {
             interaction: me.ui_data.interaction,
@@ -144,6 +198,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             space_used: me.space_used,
             output: me.output,
             drop_marker_idx: me.ui_data.drop_marker_idx,
+            dir_bottoms: me.dir_bottoms,
         }
     }
 
@@ -192,6 +247,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
     /// Close the current directory.
     pub fn close_dir(&mut self) {
         while let Some(dir_state) = self.stack.pop() {
+            self.finish_dir_layout(&dir_state);
             let indent = self
                 .indents
                 .pop_if(|indent| indent.source_node == dir_state.id);
@@ -208,6 +264,56 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 break;
             }
         }
+    }
+
+    /// Record where the subtree of a closed dir ends and verify the pinned position
+    /// that was predicted for it from the previous pass.
+    fn finish_dir_layout(&mut self, dir_state: &DirectoryState<NodeIdType>) {
+        let subtree_bottom = self.space_used.bottom();
+
+        if self.sticky_top.is_some() && dir_state.branch_expanded && dir_state.scroll_rect.is_some()
+        {
+            self.dir_bottoms
+                .insert(dir_state.id.clone(), subtree_bottom - self.space_used.top());
+        }
+
+        let Some(pin_check) = dir_state.pin_check else {
+            return;
+        };
+        let pinned_top = pin_check.pinned_top_for(subtree_bottom);
+        let prediction_held = match (pinned_top, pin_check.pinned_top) {
+            (Some(actual), Some(predicted)) => (actual - predicted).abs() < 0.5,
+            (None, None) => true,
+            _ => false,
+        };
+        if !prediction_held {
+            // The subtree changed size since the previous pass. Run another pass
+            // with the extents recorded in this one.
+            let ctx = self.ui.ctx();
+            ctx.request_discard("egui_ltreeview pinned dir moved");
+            if !ctx.will_discard() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Draw a line below the pinned dir rows.
+    fn draw_pinned_separator(&self) {
+        let Some(sticky_top) = self.sticky_top else {
+            return;
+        };
+        let clip_rect = self.ui.clip_rect();
+        if clip_rect.top() <= sticky_top {
+            return;
+        }
+
+        let mut separator_clip = clip_rect;
+        separator_clip.min.y = sticky_top;
+        self.ui.painter().with_clip_rect(separator_clip).hline(
+            self.ui_data.interaction.rect.x_range(),
+            clip_rect.top(),
+            self.ui.visuals().widgets.noninteractive.bg_stroke,
+        );
     }
 
     fn draw_indent_hint(&mut self, indent: &IndentState<NodeIdType>) {
@@ -292,7 +398,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
     pub fn node(&mut self, mut config: impl NodeConfig<NodeIdType>) -> bool {
         self.decrement_current_dir_child_count();
 
-        let (node_is_open, row_rect) = if self.current_branch_expanded() {
+        let (node_is_open, row) = if self.current_branch_expanded() {
             if config.flatten() {
                 // a flattened dir is not visible but always reports itself as open.
                 (true, None)
@@ -309,20 +415,33 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                     self.indents.len(),
                     &mut config,
                 );
-                let (node_is_open, row_rect) = self.node_structually_visible(node);
-                (node_is_open, Some(row_rect))
+                let row = self.node_structually_visible(node);
+                (row.is_open, Some(row))
             }
         } else {
             (false, None)
         };
 
         if config.is_dir() {
+            let ancestors_height = self.ancestors_pinned_height();
+            let (pinned_stack_height, child_pin_top) = match &row {
+                Some(row) => (
+                    ancestors_height + self.sticky_top.map_or(0.0, |_| row.rect.height()),
+                    row.pin_check
+                        .and_then(|check| check.pinned_top.map(|top| top + check.row_height)),
+                ),
+                // A flattened dir has no row. Its children pin where its siblings pin.
+                None => (ancestors_height, self.child_pin_top()),
+            };
             self.stack.push(DirectoryState {
                 id: config.id().clone(),
                 child_count: None,
                 branch_expanded: self.current_branch_expanded() && node_is_open,
                 branch_dragged: self.current_branch_dragged() || self.state.is_dragged(config.id()),
-                row_rect,
+                scroll_rect: row.as_ref().map(|row| row.scroll_rect),
+                pinned_stack_height,
+                child_pin_top,
+                pin_check: row.as_ref().and_then(|row| row.pin_check),
             });
         }
 
@@ -333,7 +452,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
         node_is_open
     }
 
-    fn node_structually_visible(&mut self, mut node: Node<NodeIdType>) -> (bool, Rect) {
+    fn node_structually_visible(&mut self, mut node: Node<NodeIdType>) -> NodeRow {
         let row_rect = Rect::from_min_size(
             self.space_used.left_bottom(),
             vec2(
@@ -341,10 +460,21 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 node.node_height + self.ui.spacing().item_spacing.y,
             ),
         );
+        let mut scroll_rect = row_rect;
+        scroll_rect.min.y -= self.ancestors_pinned_height();
 
-        self.do_input_structually_visible(&node, &row_rect);
+        self.do_input_structually_visible(&node, &scroll_rect);
 
-        if self.ui.clip_rect().intersects(row_rect) {
+        let pin_check = self.pin_check(&node, row_rect);
+        let pinned_rect = pin_check
+            .and_then(|check| check.pinned_top)
+            .map(|top| Rect::from_min_size(pos2(row_rect.left(), top), row_rect.size()));
+        if let Some(pinned_rect) = pinned_rect {
+            let node_width = self.node_pinned(&mut node, row_rect, pinned_rect, scroll_rect);
+            if node_width > self.space_used.width() {
+                self.space_used.set_width(node_width);
+            }
+        } else if self.ui.clip_rect().intersects(row_rect) {
             let node_width = self.node_visible_in_clip_rect(&mut node, row_rect);
             if node_width > self.space_used.width() {
                 self.space_used.set_width(node_width);
@@ -393,22 +523,22 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             }
         }
 
-        (node.is_open, row_rect)
+        NodeRow {
+            is_open: node.is_open,
+            rect: row_rect,
+            scroll_rect,
+            pin_check,
+        }
     }
 
     fn node_visible_in_clip_rect(&mut self, node: &mut Node<NodeIdType>, outer_rect: Rect) -> f32 {
         // Draw background
         if self.state.is_selected(&node.id) {
+            let color = self.selection_fill();
             let (shape_idx, rect) = self
                 .selection_background
                 .get_or_insert_with(|| (self.ui.painter().add(Shape::Noop), Rect::NOTHING));
             *rect = Rect::from_min_max(rect.min.min(outer_rect.min), rect.max.max(outer_rect.max));
-            let visuals = self.ui.visuals();
-            let color = if self.ui_data.has_focus {
-                visuals.selection.bg_fill
-            } else {
-                visuals.widgets.inactive.weak_bg_fill.linear_multiply(0.3)
-            };
             self.ui.painter().set(
                 *shape_idx,
                 Shape::rect_filled(*rect, self.ui.visuals().widgets.active.corner_radius, color),
@@ -454,8 +584,94 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             self.ui_data.has_focus,
         );
 
-        // Do input
-        self.do_input_output(node, &outer_rect, node_response.closer_rect.as_ref());
+        self.node_input_and_markers(node, outer_rect, node_response.closer_rect.as_ref());
+
+        // Save position for indent hint
+        if let Some(indent) = self.indents.last_mut() {
+            indent.positions.push(node_response.indent_anchor);
+        }
+
+        node_response.desired_width
+    }
+
+    /// Draw a dir row pinned to the top of the clip rect in place of its row in
+    /// the tree. Rows added after it are clipped below it.
+    fn node_pinned(
+        &mut self,
+        node: &mut Node<NodeIdType>,
+        row_rect: Rect,
+        pinned_rect: Rect,
+        scroll_rect: Rect,
+    ) -> f32 {
+        // The pinned row is not adjacent to the rows drawn before it.
+        self.selection_background = None;
+        let is_selected = self.state.is_selected(&node.id);
+        if is_selected {
+            self.ui.painter().rect_filled(
+                pinned_rect,
+                self.ui.visuals().widgets.active.corner_radius,
+                self.selection_fill(),
+            );
+        }
+
+        let node_response = node.show_node(
+            self.ui,
+            self.settings,
+            pinned_rect,
+            is_selected,
+            self.ui_data.has_focus,
+        );
+
+        // The drag overlay is placed from the tree position of the dragged rows.
+        // Shift it so that it starts where the pinned row was drawn.
+        if let Input::DragStarted { pos, .. } = &self.input {
+            if rect_contains_visually(&pinned_rect, pos)
+                && rect_contains_visually(&self.ui.clip_rect(), pos)
+            {
+                self.drag_start_offset = pinned_rect.min - row_rect.min;
+            }
+        }
+        self.node_input_and_markers(node, pinned_rect, node_response.closer_rect.as_ref());
+
+        // Collapsing a pinned dir removes the rows below it from the view.
+        // Scroll to the dir so that it stays where it was pinned.
+        let collapsed = self
+            .output
+            .iter()
+            .any(|a| matches!(a, BuilderActions::SetOpenness(id, _) if id == &node.id));
+        if collapsed {
+            // A top aligned scroll target ends up item spacing below the top of the view.
+            let scroll_rect = scroll_rect.translate(vec2(0.0, self.ui.spacing().item_spacing.y));
+            self.ui.scroll_to_rect(scroll_rect, Some(Align::TOP));
+        }
+
+        let mut clip_rect = self.ui.clip_rect();
+        clip_rect.min.y = clip_rect
+            .min
+            .y
+            .max(pinned_rect.bottom())
+            .min(clip_rect.max.y);
+        self.ui.set_clip_rect(clip_rect);
+
+        node_response.desired_width
+    }
+
+    fn selection_fill(&self) -> Color32 {
+        let visuals = self.ui.visuals();
+        if self.ui_data.has_focus {
+            visuals.selection.bg_fill
+        } else {
+            visuals.widgets.inactive.weak_bg_fill.linear_multiply(0.3)
+        }
+    }
+
+    fn node_input_and_markers(
+        &mut self,
+        node: &mut Node<NodeIdType>,
+        outer_rect: Rect,
+        closer_rect: Option<&Rect>,
+    ) {
+        self.do_input_output(node, &outer_rect, closer_rect);
 
         let should_open_context_menu = self
             .output
@@ -483,15 +699,47 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 egui::StrokeKind::Inside,
             );
         }
-
-        // Save position for indent hint
-        if let Some(indent) = self.indents.last_mut() {
-            indent.positions.push(node_response.indent_anchor);
-        }
-
-        node_response.desired_width
     }
 
+    /// Predict where an open dir row pins from the extent its subtree had in the
+    /// previous pass. `None` if the row cannot pin.
+    fn pin_check(&self, node: &Node<NodeIdType>, row_rect: Rect) -> Option<PinCheck> {
+        if !node.is_dir || !node.is_open {
+            return None;
+        }
+        let pin_top = self.child_pin_top()?;
+        if row_rect.top() >= pin_top {
+            return None;
+        }
+
+        let mut check = PinCheck {
+            pin_top,
+            row_height: row_rect.height(),
+            pinned_top: None,
+        };
+        check.pinned_top = self
+            .state
+            .dir_bottom(&node.id)
+            .and_then(|bottom| check.pinned_top_for(bottom + self.space_used.top()));
+        Some(check)
+    }
+
+    /// The y position at which a dir added now pins.
+    fn child_pin_top(&self) -> Option<f32> {
+        match self.stack.last() {
+            Some(dir_state) => dir_state.child_pin_top,
+            None => self.sticky_top,
+        }
+    }
+
+    /// Combined height of the dir rows that pin above a node added now.
+    fn ancestors_pinned_height(&self) -> f32 {
+        self.stack
+            .last()
+            .map_or(0.0, |dir_state| dir_state.pinned_stack_height)
+    }
+
+    /// `row_rect` is the rectangle to scroll to when this node becomes selected.
     fn do_input_structually_visible(&mut self, node: &Node<NodeIdType>, row_rect: &Rect) {
         match &mut self.input {
             Input::None => (),
@@ -523,7 +771,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                         } else if let Some(dir_state) = self.stack.last() {
                             self.output.push(BuilderActions::SelectOneNode(
                                 dir_state.id.clone(),
-                                dir_state.row_rect,
+                                dir_state.scroll_rect,
                             ));
                         }
                     }
@@ -770,6 +1018,13 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
     }
 
     fn do_input_output(&mut self, node: &Node<NodeIdType>, row_rect: &Rect, closer: Option<&Rect>) {
+        // Rows can be partly hidden below pinned dir rows. Only their visible part
+        // takes pointer input.
+        let clip_rect = self.ui.clip_rect();
+        let hit = |rect: &Rect, pos: &Pos2| {
+            rect_contains_visually(rect, pos) && rect_contains_visually(&clip_rect, pos)
+        };
+
         // Handle inputs
         match &mut self.input {
             Input::DragStarted {
@@ -778,12 +1033,13 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 visited_selected_nodes,
                 simplified_dragged,
             } => 'arm: {
-                if rect_contains_visually(row_rect, pos) {
+                if hit(row_rect, pos) {
                     if self.state.is_selected(&node.id) {
                         *selected_node_dragged = true;
                     } else {
                         self.output.push(BuilderActions::SetDragged(DragState {
-                            drag_overlay_offset: self.ui.max_rect().min.to_vec2(),
+                            drag_overlay_offset: self.ui.max_rect().min.to_vec2()
+                                + self.drag_start_offset,
                             dragged: vec![node.id.clone()],
                             simplified: vec![node.id.clone()],
                         }));
@@ -805,7 +1061,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             }
             Input::Dragged(pos) => {
                 let pos = *pos;
-                if rect_contains_visually(row_rect, &pos) && !self.current_branch_dragged() {
+                if hit(row_rect, &pos) && !self.current_branch_dragged() {
                     self.drop_on_self = self.state.is_dragged(&node.id);
                     if !self.drop_on_self {
                         self.drop_target = self.get_drop_position(row_rect, node, &pos);
@@ -827,8 +1083,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 shift_click_nodes,
             } => 'block: {
                 // Closer click
-                let closer_clicked =
-                    closer.is_some_and(|closer| rect_contains_visually(closer, pos));
+                let closer_clicked = closer.is_some_and(|closer| hit(closer, pos));
                 if closer_clicked {
                     self.output
                         .push(BuilderActions::SetOpenness(node.id.clone(), !node.is_open));
@@ -836,7 +1091,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                     break 'block;
                 }
 
-                let row_clicked = rect_contains_visually(row_rect, pos);
+                let row_clicked = hit(row_rect, pos);
                 let double_click = row_clicked
                     && *double
                     && !closer_clicked
@@ -902,7 +1157,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 }
             }
             Input::SecondaryClick(pos) => {
-                if rect_contains_visually(row_rect, pos) {
+                if hit(row_rect, pos) {
                     if node.config.has_context_menu() {
                         if self.state.is_selected(&node.id) {
                             if self.state.selected_count() == 1 {
@@ -1033,7 +1288,7 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 ..
             } if *selected_node_dragged => {
                 self.output.push(BuilderActions::SetDragged(DragState {
-                    drag_overlay_offset: self.ui.max_rect().min.to_vec2(),
+                    drag_overlay_offset: self.ui.max_rect().min.to_vec2() + self.drag_start_offset,
                     dragged: self.state.selected().clone(),
                     simplified: simplified_dragged.clone(),
                 }));

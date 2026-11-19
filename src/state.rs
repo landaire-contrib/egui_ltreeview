@@ -48,6 +48,10 @@ pub struct TreeViewState<NodeIdType: Eq + std::hash::Hash> {
     dragged: Option<DragState<NodeIdType>>,
     /// Whether to show the selected nodes in the fallback context menu
     pub(crate) show_fallback_context_menu_state: FallbackContextMenuState<NodeIdType>,
+    /// Subtree bottom of each open dir in the previous pass, relative to the top of the tree.
+    /// Used to place pinned dir rows.
+    #[cfg_attr(feature = "persistence", serde(skip, default = "HashMap::new"))]
+    pub(crate) dir_bottoms: HashMap<NodeIdType, f32>,
 }
 
 impl<NodeIdType: NodeId> Default for TreeViewState<NodeIdType> {
@@ -63,6 +67,7 @@ impl<NodeIdType: NodeId> Default for TreeViewState<NodeIdType> {
             node_states: HashMap::new(),
             last_clicked_node: None,
             show_fallback_context_menu_state: FallbackContextMenuState::ForNothing,
+            dir_bottoms: HashMap::new(),
         }
     }
 }
@@ -229,5 +234,8 @@ impl<NodeIdType: NodeId> TreeViewState<NodeIdType> {
     }
     pub(crate) fn get_selection_pivot(&self) -> Option<&NodeIdType> {
         self.selection_pivot.as_ref()
+    }
+    pub(crate) fn dir_bottom(&self, id: &NodeIdType) -> Option<f32> {
+        self.dir_bottoms.get(id).copied()
     }
 }
