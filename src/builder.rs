@@ -460,8 +460,14 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
                 node.node_height + self.ui.spacing().item_spacing.y,
             ),
         );
+        // The pinned rows never fill the view, so a row below them stays in view.
+        let pin_space = self.sticky_top.map_or(0.0, |top| {
+            normalize_rect(&self.ui.clip_rect()).bottom() - top
+        });
         let mut scroll_rect = row_rect;
-        scroll_rect.min.y -= self.ancestors_pinned_height();
+        scroll_rect.min.y -= self
+            .ancestors_pinned_height()
+            .min((pin_space - row_rect.height()).max(0.0));
 
         self.do_input_structually_visible(&node, &scroll_rect);
 
@@ -708,7 +714,10 @@ impl<'ui, NodeIdType: NodeId> TreeViewBuilder<'ui, NodeIdType> {
             return None;
         }
         let pin_top = self.child_pin_top()?;
-        if row_rect.top() >= pin_top {
+        // Leave room below the pinned row for at least one row of its subtree.
+        if row_rect.top() >= pin_top
+            || pin_top + 2.0 * row_rect.height() > normalize_rect(&self.ui.clip_rect()).bottom()
+        {
             return None;
         }
 
